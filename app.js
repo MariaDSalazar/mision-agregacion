@@ -1,0 +1,651 @@
+'use strict';
+// Misión Agregación · juego individual de funciones de agregación y agrupación en SQL:
+// una semana como analista de datos en un banco ficticio. Los datos y los resultados vienen de
+// datos.js, generado con consultas reales en SQL Server por _fuente/construir.py.
+// En datos.js todo va cifrado y en cadena: cada pedido se abre con la llave que deja el anterior resuelto bien.
+
+const J = window.JUEGO;
+const CLAVE = 'mision-agregacion-v4';   // pedidos cifrados en cadena
+const GRUPO_COLORES = ['#002C71', '#C88E00', '#910048', '#1E8C7E', '#6B4FBB'];
+const TOTAL = J.retos.reduce((s, x) => s + x.length, 0);
+let M = null;                // banco, personas y agenda de días (se descifran al arrancar)
+let K0 = '';                 // llave del primer pedido: sale de la sal pública
+const DIAS = [];             // por día: introducción y tabla, abiertas con la llave de su primer pedido
+
+let E = null;
+let repaso = false;          // al rejugar un día terminado no se cambia el puntaje
+let reproduciendo = null;
+
+/* ---------------- estado ---------------- */
+// resp: primer intento de cada pedido (puntaje) · hecho: pedidos resueltos · k: llave de cada pedido alcanzado
+const nuevo = (nombre = '', apellido = '') => ({ nombre, apellido, resp: {}, hecho: {}, k: { '0-0': K0 } });
+function cargar() {
+  try { return { ...nuevo(), ...JSON.parse(localStorage.getItem(CLAVE)) }; }
+  catch { return nuevo(); }
+}
+function guardar() { localStorage.setItem(CLAVE, JSON.stringify(E)); }
+const clave = (n, r) => `${n}-${r}`;
+const aciertos = () => Object.values(E.resp).filter(Boolean).length;
+const respondidos = () => Object.keys(E.hecho).length;
+const nRetos = n => J.retos[n].length;
+const nivelHecho = n => J.retos[n].every((_, r) => E.hecho[clave(n, r)]);
+const nivelAbierto = n => n === 0 || nivelHecho(n - 1);
+const todoHecho = () => J.retos.every((_, n) => nivelHecho(n));
+const primeroPendiente = n => J.retos[n].findIndex((_, r) => !E.hecho[clave(n, r)]);
+const aciertosNivel = n => J.retos[n].filter((_, r) => E.resp[clave(n, r)]).length;
+function estrellas(n) {
+  const p = aciertosNivel(n) / nRetos(n);
+  return p === 1 ? 3 : p >= .75 ? 2 : p >= .5 ? 1 : 0;
+}
+
+/* ---------------- utilidades ---------------- */
+const esc = s => String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+const KW = /^(SELECT|FROM|WHERE|GROUP|BY|HAVING|ORDER|AS|DESC|ASC|DISTINCT)$/;
+const FN = /^(COUNT|SUM|AVG|MIN|MAX)$/;
+function resaltar(src) {
+  return src.replace(/('(?:[^']|'')*')|([A-Za-z_][A-Za-z0-9_]*)|([^A-Za-z_']+)/g, (m, s, w) => {
+    if (s) return `<span class="s">${esc(s)}</span>`;
+    if (w) return FN.test(w) ? `<span class="f">${w}</span>` : KW.test(w) ? `<span class="k">${w}</span>` : esc(w);
+    return esc(m);
+  });
+}
+const estrellasHTML = k => `<span class="estrellas">${[0, 1, 2].map(i => `<span class="${i < k ? 'on' : ''}">${ICONO.estrella}</span>`).join('')}</span>`;
+const PARTICULAS = new Set(['de', 'del', 'la', 'las', 'los', 'y', 'e']);
+function nombreBonito(s) {
+  return s.trim().replace(/\s+/g, ' ').toLowerCase().split(' ')
+    .map((p, i) => i > 0 && PARTICULAS.has(p) ? p : p.replace(/(^|['-])(\p{L})/gu, (m, a, b) => a + b.toUpperCase()))
+    .join(' ');
+}
+function avatar(k) {
+  const p = M.personas[k];
+  const ini = p.nombre.split(' ').map(x => x[0]).join('').slice(0, 2);
+  return `<span class="avatar" style="background:${p.color}" aria-hidden="true">${ini}</span>`;
+}
+function mensaje(k, hora, html) {
+  const p = M.personas[k];
+  return `<div class="msj">${avatar(k)}<div class="burbuja"><div class="de"><b>${esc(p.nombre)}</b><span>${esc(p.cargo)}</span><span class="hora">${hora}</span></div>${html}</div></div>`;
+}
+function gafete() {
+  return `<div class="gafete"><div class="foto">${ICONO.persona}</div>
+    <div class="quien"><b>${esc(E.nombre)} ${esc(E.apellido)}</b><span class="cargo">Analista de Datos Junior</span><small>Gerencia de Analítica de Datos</small></div>
+    <div class="banco">${ICONO.banco}<span>${esc(M.banco)}</span></div></div>`;
+}
+function arriba() { window.scrollTo({ top: 0, behavior: 'smooth' }); }
+
+function barra() {
+  const quien = E.nombre ? `<div class="jugador"><b>${esc(E.nombre)} ${esc(E.apellido)}</b><br>${aciertos()} de ${TOTAL} aciertos</div>` : '';
+  return `<header class="top"><div class="logo">${datoSvg({ cara: 'feliz' })}<span>Misión <b>Agregación</b></span></div>${quien}</header>`;
+}
+function pintar(html) {
+  detener();
+  document.body.innerHTML = barra() + `<main id="app">${html}</main>`;
+  arriba();
+}
+const $ = s => document.querySelector(s);
+const $$ = s => [...document.querySelectorAll(s)];
+
+/* ---------------- pedidos cifrados en cadena ----------------
+   Cada pedido (mensaje, tabla, opciones y consulta) se abre con su llave, que solo trae el pedido anterior
+   resuelto bien. Al elegir, se abre solo la retroalimentación de lo elegido; la respuesta correcta nunca se muestra. */
+const abrirCon = async (dato, ...partes) => Cifra.abrir(await Cifra.llave(...partes), dato);
+async function dia(n) {
+  if (!DIAS[n]) DIAS[n] = await abrirCon(J.niveles[n], E.k[clave(n, 0)], n, 'nivel');
+  return DIAS[n];
+}
+const contenido = (n, r) => abrirCon(J.retos[n][r].c, E.k[clave(n, r)], clave(n, r), 'reto');
+const parte = (n, r, p, i, v) => abrirCon(J.retos[n][r].p[p][i], E.k[clave(n, r)], clave(n, r), p, v);
+const despuesDe = (n, r) => r + 1 < nRetos(n) ? [n, r + 1] : n + 1 < J.retos.length ? [n + 1, 0] : null;
+async function calificar(n, r, rt, bien, detalles, canon) {
+  let s = null;
+  if (bien) { try { s = await abrirCon(J.retos[n][r].x, E.k[clave(n, r)], clave(n, r), 'fin', canon); } catch { s = null; } }
+  const k = clave(n, r);
+  if (!repaso && !(k in E.resp)) E.resp[k] = !!s;
+  if (s) {
+    E.hecho[k] = true;
+    const sig = despuesDe(n, r);
+    if (sig && s.sig) E.k[clave(...sig)] = s.sig;
+  }
+  guardar();
+  responder(n, r, rt, s, detalles);
+}
+
+/* ---------------- tabla de datos ---------------- */
+function valor(v, tipo) {
+  if (v === null) return 'NULL';
+  if (tipo === 'dec') return Number(v).toFixed(2);
+  return String(v);
+}
+function colIdx(t, c) { return t.cols.findIndex(x => x[0] === c); }
+
+// est: {col, nulos, excluir:Set, grupo, gfuera:Set, marcar:Set, aggTexto:{grupo:texto}}
+function tablaHTML(t, est = {}) {
+  const N = t.cols.length;
+  const cab = t.cols.map(([c]) => `<th class="${c === est.col ? 'hl' : ''}">${c}</th>`).join('');
+  const fila = (i, extra = '', estilo = '') => {
+    const f = t.filas[i];
+    const clases = [extra, est.excluir?.has(i) ? 'fuera' : '', est.marcar?.has(i) ? 'estrella' : ''].join(' ');
+    const celdas = t.cols.map(([c, tipo], k) => {
+      const v = f[k], cl = [];
+      if (tipo === 'int' || tipo === 'dec') cl.push('n');
+      if (v === null) cl.push('nulo');
+      if (c === est.col) cl.push('hl');
+      if (c === 'Estado') cl.push(t.malos.includes(v) ? 'est-no' : 'est-ok');
+      const nota = v === null && c === est.col && est.nulos ? '<span class="nocuenta">no cuenta</span>' : '';
+      return `<td class="${cl.join(' ')}">${esc(valor(v, tipo))}${nota}</td>`;
+    }).join('');
+    return `<tr class="${clases}" style="${estilo}">${celdas}</tr>`;
+  };
+  let cuerpo = '';
+  if (est.grupo) {
+    const g = colIdx(t, est.grupo);
+    const vivas = t.filas.map((_, i) => i).filter(i => !est.excluir?.has(i));
+    const grupos = agruparFilas(t, vivas, g);
+    grupos.forEach(([gv, filas], k) => {
+      const color = GRUPO_COLORES[k % GRUPO_COLORES.length];
+      const fuera = est.gfuera?.has(gv) ? ' gfuera' : '';
+      const extra = est.aggTexto?.[gv] ? ` · ${est.aggTexto[gv]}` : '';
+      cuerpo += `<tr class="cab-grupo${fuera}"><td colspan="${N}" style="background:${color}">${esc(gv)} · ${filas.length} ${filas.length === 1 ? 'fila' : 'filas'}${extra}${fuera ? ' · no cumple el HAVING' : ''}</td></tr>`;
+      filas.forEach(i => { cuerpo += fila(i, 'g' + fuera, `--gc:${color}`); });
+    });
+    const descartadas = t.filas.map((_, i) => i).filter(i => est.excluir?.has(i));
+    if (descartadas.length) {
+      cuerpo += `<tr class="cab-grupo gfuera"><td colspan="${N}" style="background:#8a95a1">Descartadas por el WHERE · ${descartadas.length}</td></tr>`;
+      descartadas.forEach(i => { cuerpo += fila(i); });
+    }
+  } else {
+    t.filas.forEach((_, i) => { cuerpo += fila(i); });
+  }
+  const hayNull = t.filas.some(f => f.includes(null));
+  return `<div class="tabla-wrap"><table class="datos"><thead><tr>${cab}</tr></thead><tbody>${cuerpo}</tbody></table></div>`
+    + `<p class="leyenda">Tabla <b>${t.nombre}</b> · ${t.filas.length} filas${hayNull ? ' · NULL = celda vacía' : ''}</p>`;
+}
+function agruparFilas(t, filas, g) {
+  const m = new Map();
+  filas.forEach(i => { const v = t.filas[i][g]; if (!m.has(v)) m.set(v, []); m.get(v).push(i); });
+  return [...m.entries()].sort((a, b) => String(a[0]).localeCompare(String(b[0]), 'es'));
+}
+
+/* ---------------- motor de las fases (solo para la animación, después de acertar) ---------------- */
+function agregar(t, agg, col, filas) {
+  if (col === '*') return filas.length;
+  const k = colIdx(t, col), tipo = t.cols[k][1];
+  const vals = filas.map(i => t.filas[i][k]).filter(v => v !== null);
+  if (agg === 'COUNT') return vals.length;
+  if (agg === 'COUNT DISTINCT') return new Set(vals).size;
+  if (agg === 'SUM') { const s = vals.reduce((a, b) => a + b, 0); return tipo === 'dec' ? s.toFixed(2) : s; }
+  if (agg === 'AVG') {
+    const s = vals.reduce((a, b) => a + b, 0);
+    return tipo === 'int' ? Math.trunc(s / vals.length) : (s / vals.length).toFixed(2);
+  }
+  const orden = vals.slice().sort((a, b) => typeof a === 'number' ? a - b : String(a).localeCompare(String(b), 'es'));
+  const v = agg === 'MIN' ? orden[0] : orden[orden.length - 1];
+  return tipo === 'dec' ? Number(v).toFixed(2) : v;
+}
+function cumple(a, op, b) {
+  const x = typeof b === 'number' ? Number(a) : a;
+  return { '=': x === b, '>': x > b, '<': x < b, '>=': x >= b, '<=': x <= b }[op];
+}
+const lit = v => typeof v === 'number' ? v : `'${v}'`;
+const exprAgg = (agg, col) => agg === 'COUNT DISTINCT' ? `COUNT(DISTINCT ${col})` : `${agg}(${col})`;
+
+function pasos(f, t) {
+  const out = [];
+  const todas = t.filas.map((_, i) => i);
+  out.push({ fase: 'FROM', texto: `<code>FROM ${t.nombre}</code>: SQL toma las <b>${todas.length}</b> filas de la tabla.`, est: {} });
+  let vivas = todas, excluir = new Set();
+  if (f.where) {
+    const [c, op, v] = f.where, k = colIdx(t, c);
+    vivas = todas.filter(i => cumple(t.filas[i][k], op, v));
+    excluir = new Set(todas.filter(i => !vivas.includes(i)));
+    out.push({ fase: 'WHERE', texto: `<code>WHERE ${c} ${op} ${esc(lit(v))}</code> revisa cada fila: quedan <b>${vivas.length}</b> de ${todas.length}; las demás se descartan.`, est: { excluir } });
+  }
+  const textoTotal = (agg, col) => exprAgg(agg, col);
+  if (f.group) {
+    const g = colIdx(t, f.group);
+    const grupos = agruparFilas(t, vivas, g);
+    const aggTexto = {};
+    grupos.forEach(([gv, fs]) => { aggTexto[gv] = `${textoTotal(f.agg, f.col)} = ${agregar(t, f.agg, f.col, fs)}`; });
+    out.push({ fase: 'GROUP BY', texto: `<code>GROUP BY ${f.group}</code> arma <b>${grupos.length}</b> grupos, uno por cada ${f.group} distinto: ${grupos.map(([gv, fs]) => `${esc(gv)} (${fs.length})`).join(', ')}.`, est: { excluir, grupo: f.group } });
+    let gfuera = new Set();
+    if (f.having) {
+      const [agg, col, op, v] = f.having;
+      const valores = grupos.map(([gv, fs]) => [gv, agregar(t, agg, col, fs)]);
+      const quedan = valores.filter(([, x]) => cumple(x, op, v)), salen = valores.filter(([, x]) => !cumple(x, op, v));
+      gfuera = new Set(salen.map(([gv]) => gv));
+      const hAgg = {};
+      valores.forEach(([gv, x]) => { hAgg[gv] = `${exprAgg(agg, col)} = ${x}`; });
+      out.push({ fase: 'HAVING', texto: `<code>HAVING ${exprAgg(agg, col)} ${op} ${v}</code> revisa el total de cada grupo: quedan <b>${quedan.length}</b>${quedan.length ? ' (' + quedan.map(([gv, x]) => `${esc(gv)}: ${x}`).join(', ') + ')' : ''}${salen.length ? '; salen ' + salen.map(([gv, x]) => `${esc(gv)} (${x})`).join(', ') : ''}.`, est: { excluir, grupo: f.group, gfuera, aggTexto: hAgg } });
+    }
+    const vivos = grupos.filter(([gv]) => !gfuera.has(gv));
+    out.push({ fase: 'SELECT', texto: `<code>SELECT</code> calcula <code>${textoTotal(f.agg, f.col)}</code> en cada grupo que queda: ${vivos.map(([gv, fs]) => `${esc(gv)} = <b>${agregar(t, f.agg, f.col, fs)}</b>`).join(' · ')}. Una fila por grupo.`, est: { excluir, grupo: f.group, gfuera, aggTexto, col: f.col === '*' ? null : f.col } });
+    return out;
+  }
+  // sin GROUP BY: todas las filas que quedan forman un solo grupo
+  const k = f.col === '*' ? -1 : colIdx(t, f.col);
+  const conValor = k < 0 ? vivas : vivas.filter(i => t.filas[i][k] !== null);
+  const nulos = vivas.length - conValor.length;
+  const res = agregar(t, f.agg, f.col, vivas);
+  const tipo = k < 0 ? 'int' : t.cols[k][1];
+  const v = i => valor(t.filas[i][k], tipo);
+  let texto, marcar = new Set();
+  if (f.agg === 'COUNT' && f.col === '*') texto = `<code>COUNT(*)</code> cuenta las filas que quedan: <b>${res}</b>.`;
+  else if (f.agg === 'COUNT') texto = `<code>COUNT(${f.col})</code> cuenta solo las celdas con valor: <b>${res}</b>. Las ${nulos} vacías (NULL) no cuentan.`;
+  else if (f.agg === 'COUNT DISTINCT') {
+    const vistos = [];
+    conValor.forEach(i => { if (!vistos.includes(t.filas[i][k])) { vistos.push(t.filas[i][k]); marcar.add(i); } });
+    texto = `Valores distintos de ${f.col}: ${vistos.map(esc).join(', ')}. Cada uno cuenta una vez: <b>${res}</b>.`;
+  } else if (f.agg === 'SUM') texto = `${conValor.map(v).join(' + ')} = <b>${res}</b>${nulos ? `. Las ${nulos} celdas vacías no suman.` : '.'}`;
+  else if (f.agg === 'AVG') {
+    const s = conValor.reduce((a, i) => a + t.filas[i][k], 0);
+    texto = `Suma: ${conValor.map(v).join(' + ')} = ${tipo === 'dec' ? s.toFixed(2) : s}. Se divide para <b>${conValor.length}</b>${nulos ? ` (los ${nulos} NULL no entran)` : ''}: ${tipo === 'dec' ? s.toFixed(2) : s} ÷ ${conValor.length} = <b>${res}</b>.`;
+  } else {
+    const etiq = t.cols.findIndex(([, tp]) => tp === 'txt');
+    conValor.forEach(i => { if (String(v(i)) === String(res)) marcar.add(i); });
+    const quien = [...marcar].map(i => esc(t.filas[i][etiq])).join(', ');
+    const como = tipo === 'txt' ? ' en orden alfabético' : tipo === 'fecha' ? ' (la fecha' + (f.agg === 'MIN' ? ' más antigua)' : ' más reciente)') : '';
+    texto = `<code>${f.agg}(${f.col})</code> busca el valor ${f.agg === 'MIN' ? 'más bajo' : 'más alto'}${como}: <b>${esc(res)}</b>${tipo === 'txt' ? '' : ` (${quien})`}.`;
+  }
+  out.push({ fase: 'SELECT', texto, est: { excluir, col: k < 0 ? null : f.col, nulos: ['COUNT', 'SUM', 'AVG'].includes(f.agg), marcar } });
+  return out;
+}
+
+/* ---------------- pantallas ---------------- */
+function inicio() {
+  const chips = ['COUNT', 'SUM', 'AVG', 'MIN', 'MAX', 'GROUP BY', 'HAVING'].map(c => `<span class="chip oscuro">${c}</span>`).join('');
+  const registro = E.nombre
+    ? `${gafete()}<h2>Hola de nuevo, ${esc(E.nombre)}</h2><p class="suave">Llevas ${respondidos()} de ${TOTAL} solicitudes atendidas y ${aciertos()} respuestas correctas al primer intento.</p>
+       <div class="fila-btn"><button class="btn grande" id="seguir">Volver a la oficina ${ICONO.sig}</button></div>
+       <div class="fila-btn"><button class="btn sec" id="otro">Soy otra persona / empezar de nuevo</button></div>`
+    : `<h2>Registro de ingreso</h2><p class="suave">Escribe tu nombre y tu apellido: van en tu credencial y en tu certificado.</p>
+       <label for="nom">Nombre</label><input type="text" id="nom" autocomplete="given-name" maxlength="30">
+       <label for="ape">Apellido</label><input type="text" id="ape" autocomplete="family-name" maxlength="30">
+       <p class="aviso" id="aviso"></p>
+       <button class="btn grande" id="empezar">Empezar mi primer día ${ICONO.sig}</button>`;
+  pintar(`<section class="portada">${datoSvg({ cara: 'feliz', brazos: 'arriba' })}
+      <h1>Misión <b>Agregación</b></h1>
+      <p>Una semana como analista de datos en <b>${esc(M.banco)}</b> · SQL</p>
+      <div class="chips-niveles">${chips}</div></section>
+    <div class="card">${registro}</div>
+    <div class="card"><h2>${ICONO.banco} Tu nuevo trabajo</h2>
+      <p>Entras como <b>analista de datos junior</b> en ${esc(M.banco)}, un banco ficticio. Cada día apoyas a un área distinta: Operaciones, Tesorería, Canales Digitales, Gerencia Comercial, Riesgo Operativo y, al final, el cierre de mes. La dificultad sube cada día.</p>
+      <p>Tus compañeros te escriben con pedidos reales de trabajo. Los datos vienen como en la vida real: con <b>duplicados, celdas vacías, operaciones rechazadas y errores de digitación</b>. Si una respuesta no cuadra, te explican por qué y lo vuelves a intentar; cuando aciertas, ves <b>cómo lo resuelve SQL paso a paso</b>. Al final recibes tu <b>certificado</b>, que cuenta tu primer intento en cada pedido.</p></div>`);
+  if (E.nombre) {
+    $('#seguir').onclick = mapa;
+    $('#otro').onclick = () => { if (confirm('Se borrará el progreso guardado en este dispositivo. ¿Continuar?')) { E = nuevo(); guardar(); inicio(); } };
+    return;
+  }
+  const valido = s => /^[\p{L}][\p{L}' -]{1,29}$/u.test(s.trim());
+  $('#empezar').onclick = () => {
+    const n = $('#nom').value, a = $('#ape').value;
+    if (!valido(n) || !valido(a)) { $('#aviso').textContent = 'Escribe tu nombre y tu apellido (solo letras).'; return; }
+    E = nuevo(nombreBonito(n), nombreBonito(a));
+    guardar();
+    mapa();
+  };
+}
+
+function mapa() {
+  repaso = false;
+  const pct = Math.round(respondidos() / TOTAL * 100);
+  const nodos = M.niveles.map((nv, n) => {
+    const hecho = nivelHecho(n), abierto = nivelAbierto(n);
+    const clase = hecho ? 'hecho' : abierto ? 'actual' : '';
+    const der = hecho ? estrellasHTML(estrellas(n)) : abierto ? `<span class="chip">${ICONO.play} Entrar</span>` : `<span class="suave">${ICONO.candado}</span>`;
+    return `<button class="nodo ${clase}" data-n="${n}" ${abierto ? '' : 'disabled'}>
+      <span class="medalla">${ICONO[nv.icono]}<span class="num">${n + 1}</span></span>
+      <span><b>${nv.dia} · ${nv.area}</b><small>${nv.clave} · ${nv.caso}</small></span>${der}</button>`;
+  }).join('');
+  pintar(`${gafete()}
+    <div class="kpis"><div class="kpi"><b>${respondidos()}/${TOTAL}</b>solicitudes atendidas</div>
+      <div class="kpi"><b>${aciertos()}</b>correctas al primer intento</div>
+      <div class="kpi"><b>${M.niveles.filter((_, n) => nivelHecho(n)).length}/${M.niveles.length}</b>días completos</div></div>
+    <h2>${ICONO.agenda} Tu agenda</h2>
+    <div class="progreso"><i style="width:${pct}%"></i></div>
+    <div class="mapa">${nodos}</div>
+    ${todoHecho() ? `<div class="fila-btn"><button class="btn grande" id="cert">${ICONO.trofeo} Ver mi certificado</button></div>` : ''}`);
+  $$('.nodo:not(:disabled)').forEach(b => { b.onclick = () => intro(+b.dataset.n); });
+  if (todoHecho()) $('#cert').onclick = certificado;
+}
+
+function casoHTML(n) {
+  return `<div class="caso">${ICONO[M.niveles[n].icono]}<div><b>${DIAS[n].tabla.caso}</b>${esc(DIAS[n].contexto)}</div></div>`;
+}
+
+async function intro(n) {
+  if (!E.k[clave(n, 0)]) { mapa(); return; }
+  const nv = M.niveles[n], d = await dia(n);
+  repaso = nivelHecho(n);
+  const desde = repaso ? 0 : Math.max(primeroPendiente(n), 0);
+  pintar(`<div class="cabeza-reto"><button class="btn sec" id="volver">${ICONO.agenda} Agenda</button>
+      <span class="chip oscuro">${nv.dia} · ${nv.area} · ${nv.clave}</span></div>
+    <div class="card">
+      ${mensaje('lucia', d.hora, `<p>${esc(d.intro)}</p>`)}
+      ${casoHTML(n)}
+      ${tablaHTML(d.tabla)}
+      ${repaso ? '<p class="suave"><b>Modo repaso:</b> ya terminaste este día; tu puntaje no cambia.</p>' : ''}
+      <div class="fila-btn"><button class="btn grande" id="comenzar">${desde ? `Seguir con la solicitud ${desde + 1}` : `Abrir la bandeja · ${nRetos(n)} solicitudes`} ${ICONO.sig}</button></div>
+    </div>`);
+  $('#volver').onclick = mapa;
+  $('#comenzar').onclick = () => reto(n, desde);
+}
+
+async function reto(n, r) {
+  if (!E.k[clave(n, r)]) { mapa(); return; }
+  const nv = M.niveles[n], d = await dia(n), rt = await contenido(n, r);
+  const puntos = J.retos[n].map((_, k) => {
+    const c = clave(n, k);
+    return `<i class="${k === r ? 'ahora' : E.hecho[c] && !repaso ? (E.resp[c] ? 'ok' : 'no') : ''}"></i>`;
+  }).join('');
+  pintar(`<div class="cabeza-reto"><button class="btn sec" id="volver">${ICONO.agenda} Agenda</button>
+      <span class="chip oscuro">${nv.dia} · Solicitud ${r + 1} de ${nRetos(n)}</span><span class="puntos">${puntos}</span></div>
+    <div class="card">
+      ${mensaje(rt.de, rt.hora, `<p class="pregunta">${esc(rt.pregunta)}</p>`)}
+      <div class="reto-cuerpo">
+        <div>${rt.tabla ? casoHTML(n) + tablaHTML(d.tabla) : ''}</div>
+        <div>${rt.sql ? `<pre class="sql">${resaltar(rt.sql)}</pre><p></p>` : ''}
+          <p class="tu-resp">${ICONO.enviar} Tu respuesta</p>
+          <div id="zona"></div></div>
+      </div>
+      <div class="fila-btn oculto" id="nav"><button class="btn sec" id="reabrir">${ICONO.ojo} Ver retroalimentación</button>
+        <button class="btn grande" id="siguiente2"></button></div>
+    </div>
+    <dialog id="dlg" aria-labelledby="dlg-titulo">
+      <div class="dlg-cuerpo" id="retro"></div>
+      <div class="dlg-pie"><button class="btn sec" id="cerrar">${ICONO.cerrar} Cerrar</button><button class="btn grande" id="siguiente"></button></div>
+    </dialog>`);
+  $('#volver').onclick = mapa;
+  ({ opcion: zonaOpciones, error: zonaError, orden: zonaOrden, clasifica: zonaClasifica })[rt.tipo](n, r, rt);
+}
+
+/* ---------------- tipos de reto ---------------- */
+function barajar(a) {
+  for (let i = a.length - 1; i > 0; i--) { const j = Math.floor(Math.random() * (i + 1)); [a[i], a[j]] = [a[j], a[i]]; }
+  return a;
+}
+
+function zonaOpciones(n, r, rt) {
+  const orden = barajar(rt.opciones.map((_, i) => i));
+  $('#zona').innerHTML = `<div class="opciones${rt.cod ? ' de-codigo' : ''}">${orden.map(i =>
+    `<button class="op${rt.cod ? ' cod' : ''}" data-i="${i}">${rt.cod ? resaltar(rt.opciones[i]) : esc(rt.opciones[i])}</button>`).join('')}</div>`;
+  $$('.op').forEach(b => {
+    b.onclick = async () => {
+      $$('.op').forEach(x => { x.disabled = true; });
+      const i = +b.dataset.i, fb = await parte(n, r, 'op', i, rt.opciones[i]);
+      b.classList.add(fb.ok ? 'ok' : 'no');
+      calificar(n, r, rt, fb.ok, fb.ok ? [] : [fb.porque], rt.opciones[i]);
+    };
+  });
+}
+
+function zonaError(n, r, rt) {
+  $('#zona').innerHTML = `<div class="lineas">${rt.lineas.map((l, i) => `<button class="linea" data-i="${i}">${resaltar(l)}</button>`).join('')}</div>`;
+  $$('.linea').forEach(b => {
+    b.onclick = async () => {
+      $$('.linea').forEach(x => { x.disabled = true; });
+      const i = +b.dataset.i, fb = await parte(n, r, 'lin', i, String(i));
+      b.classList.add(fb.ok ? 'ok' : 'no');
+      calificar(n, r, rt, fb.ok, fb.ok ? [] : [`Línea ${i + 1}: ${fb.porque}`], String(i));
+    };
+  });
+}
+
+function zonaOrden(n, r, rt) {
+  const fichas = barajar(rt.items.map((x, i) => [x, i]));
+  const puesto = [];
+  const dibujar = () => {
+    $('#zona').innerHTML = `<div class="ranuras">${rt.items.map((_, k) => `<div class="ranura${puesto[k] !== undefined ? ' llena' : ''}" data-k="${k}"><span class="n">${k + 1}</span>${puesto[k] !== undefined ? esc(rt.items[puesto[k]]) : ''}</div>`).join('')}</div>
+      <p class="suave">Toca las piezas en orden. Toca una casilla llena para quitar su pieza.</p>
+      <div class="fichas">${fichas.map(([x, i]) => `<button class="ficha" data-i="${i}" ${puesto.includes(i) ? 'disabled' : ''}>${esc(x)}</button>`).join('')}</div>
+      <div class="fila-btn"><button class="btn azul" id="comprobar" ${puesto.filter(x => x !== undefined).length === rt.items.length ? '' : 'disabled'}>Comprobar</button></div>`;
+    $$('.ficha:not(:disabled)').forEach(b => {
+      b.onclick = () => { const libre = rt.items.findIndex((_, k) => puesto[k] === undefined); puesto[libre] = +b.dataset.i; dibujar(); };
+    });
+    $$('.ranura.llena').forEach(d => { d.onclick = () => { puesto[+d.dataset.k] = undefined; dibujar(); }; });
+    $('#comprobar').onclick = async () => {
+      $('#comprobar').disabled = true;
+      $$('.ranura').forEach(d => { d.onclick = null; });
+      $$('.ficha').forEach(b => { b.disabled = true; });
+      const fb = await Promise.all(puesto.map((i, k) => parte(n, r, `s${k}`, i, rt.items[i])));
+      $$('.ranura').forEach((d, k) => d.classList.add(fb[k].ok ? 'ok' : 'no'));
+      const det = fb.map((f, k) => f.ok ? '' : `Casilla ${k + 1}, ${rt.items[puesto[k]]}: no va en esa posición. ${f.porque}`).filter(Boolean);
+      calificar(n, r, rt, !det.length, det, puesto.map(i => rt.items[i]).join('|'));
+    };
+  };
+  dibujar();
+}
+
+function zonaClasifica(n, r, rt) {
+  const elegido = rt.conds.map(() => null);
+  $('#zona').innerHTML = `<div class="clasif">${rt.conds.map((txt, k) => `<div class="cond" data-k="${k}"><code>${esc(txt)}</code>
+      <div class="dos"><button data-v="WHERE">WHERE</button><button data-v="HAVING">HAVING</button></div><div class="porque oculto"></div></div>`).join('')}</div>
+    <div class="fila-btn"><button class="btn azul" id="comprobar" disabled>Comprobar</button></div>`;
+  $$('.cond').forEach(c => {
+    const k = +c.dataset.k;
+    c.querySelectorAll('button').forEach(b => {
+      b.onclick = () => {
+        elegido[k] = b.dataset.v;
+        c.querySelectorAll('button').forEach(x => x.classList.toggle('on', x === b));
+        $('#comprobar').disabled = elegido.includes(null);
+      };
+    });
+  });
+  // al fallar no se marca cuál condición está mal: con dos opciones, marcarla sería decir la correcta
+  $('#comprobar').onclick = async () => {
+    $('#comprobar').disabled = true;
+    $$('.cond button').forEach(b => { b.disabled = true; });
+    const fb = await Promise.all(elegido.map((v, k) => parte(n, r, `c${k}`, ['WHERE', 'HAVING'].indexOf(v), v)));
+    const bien = fb.filter(f => f.ok).length, ok = bien === fb.length;
+    calificar(n, r, rt, ok, ok ? [] : [`Acertaste ${bien} de ${fb.length}. ${fb.find(f => !f.ok).porque}`], elegido.join(';'));
+  };
+}
+
+/* ---------------- respuesta: al acertar se ve la solución; al fallar se explica por qué y se reintenta ---------------- */
+function responder(n, r, rt, s, detalles) {
+  const ok = !!s, ultimo = r === nRetos(n) - 1, t = DIAS[n].tabla;
+  let asi = '';
+  if (ok && rt.tipo === 'clasifica') {
+    $$('.cond').forEach((c, k) => {
+      c.querySelector('button.on')?.classList.add('ok');
+      const p = c.querySelector('.porque'); p.textContent = s.items[k][2]; p.classList.remove('oculto');
+    });
+    asi = `<p><b>Por qué así:</b></p><ul class="asi">${s.items.map(([txt, v, porque]) => `<li><code>${esc(txt)}</code> va en <b>${v}</b>: ${esc(porque)}</li>`).join('')}</ul>`;
+  }
+  const arte = ok ? datoSvg({ cara: 'festeja', brazos: 'arriba' }) : sticker(rt.st);
+  $('#retro').innerHTML = ok
+    ? `<div class="retro ok">${arte}<div><h3 id="dlg-titulo">¡Correcto! Respuesta enviada</h3>
+        <div class="cita">${avatar(rt.de)}<span><b>${esc(M.personas[rt.de].nombre)}:</b> «${esc(s.gracias)}»</span></div></div></div>
+       <p class="explica">${esc(s.explica)}</p>${asi}${solucion(rt, s, t)}`
+    : `<div class="retro no">${arte}<div><h3 id="dlg-titulo">Ese dato no cuadra</h3>
+        <p><b>Por qué no:</b></p><ul>${detalles.map(d => `<li>${esc(d)}</li>`).join('')}</ul>
+        <p class="suave">Relee el pedido y la tabla, y vuelve a intentarlo.</p></div></div>`;
+  if (ok) activarPasos(s, t);
+  const dlg = $('#dlg');
+  const avanzar = () => { dlg.close(); if (!ok) reto(n, r); else if (ultimo) finNivel(n); else reto(n, r + 1); };
+  ['#siguiente', '#siguiente2'].forEach(b => {
+    $(b).innerHTML = !ok ? 'Intentar de nuevo' : ultimo ? `Cerrar el día ${ICONO.sig}` : `Siguiente solicitud ${ICONO.sig}`;
+    $(b).onclick = avanzar;
+  });
+  $('#cerrar').onclick = () => dlg.close();
+  $('#reabrir').onclick = () => dlg.showModal();
+  // al cerrar (botón, Esc o toque fuera) queda la barra para reabrir; si ya se cambió de pantalla, no hace nada
+  dlg.onclose = () => { if (dlg.isConnected) { detener(); $('#nav').classList.remove('oculto'); } };
+  dlg.onclick = e => { if (e.target === dlg) dlg.close(); };
+  const jug = $('header .jugador');
+  if (jug) jug.innerHTML = `<b>${esc(E.nombre)} ${esc(E.apellido)}</b><br>${aciertos()} de ${TOTAL} aciertos`;
+  dlg.showModal();
+  $('#retro').scrollTop = 0;
+}
+
+function tablaResultado(res) {
+  return `<table class="res"><thead><tr>${res.cols.map(c => `<th>${esc(c)}</th>`).join('')}</tr></thead>
+    <tbody>${res.filas.map(f => `<tr>${f.map(v => `<td>${esc(v)}</td>`).join('')}</tr>`).join('')}</tbody></table>`;
+}
+
+function solucion(rt, s, t) {
+  if (rt.tipo === 'orden' && !s.sql) {
+    return `<div class="paso-a-paso"><h2>${ICONO.codigo} El orden correcto</h2><div class="fases">${s.orden.map((x, i) =>
+      `<span class="fase actual">${i + 1} ${esc(x)}</span>`).join('')}</div></div>`;
+  }
+  if (rt.tipo === 'clasifica') return '';
+  const msg = rt.tipo === 'error' ? `<div class="msg">Mensaje de SQL Server con la consulta original:\n${esc(s.mensaje)}</div><h3 style="margin:12px 0 6px;color:#146b3d">Consulta corregida</h3>` : '';
+  const ps = s.fases ? pasos(s.fases, t) : [];
+  return `<div class="paso-a-paso"><h2>${ICONO.ojo} Cómo lo resuelve SQL, paso a paso</h2>${msg}
+    <pre class="sql">${resaltar(s.sql)}</pre>
+    ${ps.length ? `<p></p><div class="fases" id="fases">${ps.map((p, i) => `<button class="fase" data-i="${i}">${i + 1} ${p.fase}</button>`).join('')}</div>
+      <div class="explicacion-fase" id="expf"></div><div id="tpasos"></div>
+      <div class="fila-btn"><button class="btn sec" id="pant">${ICONO.ant} Anterior</button>
+        <button class="btn azul" id="pplay">${ICONO.play} Reproducir</button>
+        <button class="btn sec" id="psig">Siguiente ${ICONO.sig}</button></div>` : ''}
+    <div class="resultado"><h3>${ICONO.bien} Resultado real en SQL Server</h3>${tablaResultado(s.resultado)}</div></div>`;
+}
+
+function activarPasos(s, t) {
+  if (!s.fases) return;
+  const ps = pasos(s.fases, t);
+  let k = 0;
+  const ver = i => {
+    k = Math.max(0, Math.min(ps.length - 1, i));
+    $$('#fases .fase').forEach((b, j) => { b.className = 'fase' + (j < k ? ' hecha' : j === k ? ' actual' : ''); });
+    $('#expf').innerHTML = `Paso ${k + 1} de ${ps.length} · ${ps[k].texto}`;
+    $('#tpasos').innerHTML = tablaHTML(t, ps[k].est);
+  };
+  $$('#fases .fase').forEach(b => { b.onclick = () => { detener(); ver(+b.dataset.i); }; });
+  $('#pant').onclick = () => { detener(); ver(k - 1); };
+  $('#psig').onclick = () => { detener(); ver(k + 1); };
+  $('#pplay').onclick = () => {
+    if (reproduciendo) { detener(); return; }
+    ver(0);
+    $('#pplay').innerHTML = `${ICONO.pausa} Pausa`;
+    reproduciendo = setInterval(() => { if (k >= ps.length - 1) detener(); else ver(k + 1); }, 2200);
+  };
+  ver(0);
+}
+function detener() {
+  if (reproduciendo) { clearInterval(reproduciendo); reproduciendo = null; }
+  const b = document.getElementById('pplay'); if (b) b.innerHTML = `${ICONO.play} Reproducir`;
+}
+
+function confeti() {
+  const c = document.createElement('div'); c.className = 'confeti';
+  const colores = ['#EAAA00', '#FFFFFF', '#910048', '#7fb4ff', '#1E9E5A'];
+  c.innerHTML = Array.from({ length: 70 }, () => `<i style="left:${Math.random() * 100}%;background:${colores[Math.floor(Math.random() * colores.length)]};animation-duration:${2 + Math.random() * 2.5}s;animation-delay:${Math.random() * .8}s"></i>`).join('');
+  document.body.appendChild(c);
+  setTimeout(() => c.remove(), 5000);
+}
+
+function finNivel(n) {
+  const nv = M.niveles[n], est = estrellas(n), bien = aciertosNivel(n);
+  const msj = repaso ? 'Repaso terminado. Tu puntaje no cambia.' :
+    est === 3 ? '¡Día perfecto! Todo el equipo confía en tus números.' : est === 2 ? '¡Muy buen día! Casi todo cuadró.' : est === 1 ? 'Buen día. Repasa los porqués: mañana se usa lo de hoy.' : 'Día difícil. Revisa las explicaciones antes de seguir: mañana se usa lo de hoy.';
+  const siguiente = n + 1 < M.niveles.length;
+  pintar(`<div class="card fin">${datoSvg({ cara: est >= 2 ? 'festeja' : 'feliz', brazos: est >= 2 ? 'arriba' : 'abajo' })}
+      <h2 style="justify-content:center">${nv.dia} · ${nv.area}: día terminado</h2>
+      ${estrellasHTML(est)}
+      <p><b>${bien} de ${nRetos(n)}</b> solicitudes bien resueltas al primer intento · ${msj}</p>
+      <div class="fila-btn">
+        ${siguiente ? `<button class="btn grande" id="sig">Ir al día siguiente: ${M.niveles[n + 1].dia} ${ICONO.sig}</button>` : `<button class="btn grande" id="cert">${ICONO.trofeo} Ver mi certificado</button>`}
+      </div>
+      <div class="fila-btn"><button class="btn sec" id="mapa">${ICONO.agenda} Volver a la agenda</button></div></div>`);
+  if (est >= 2 && !repaso) confeti();
+  $('#mapa').onclick = mapa;
+  if (siguiente) $('#sig').onclick = () => intro(n + 1);
+  else $('#cert').onclick = certificado;
+}
+
+/* ---------------- certificado ---------------- */
+function rango(p) { return p >= 90 ? 'Analista de datos senior' : p >= 75 ? 'Analista de datos' : p >= 50 ? 'Analista de datos junior' : 'Pasante de datos'; }
+function codigo(texto) {
+  let h = 0x811c9dc5;
+  for (const ch of texto) { h ^= ch.codePointAt(0); h = Math.imul(h, 0x01000193) >>> 0; }
+  const s = h.toString(36).toUpperCase().padStart(8, '0').slice(-8);
+  return s.slice(0, 4) + '-' + s.slice(4);
+}
+const cargarImg = src => new Promise((ok, mal) => { const i = new Image(); i.onload = () => ok(i); i.onerror = mal; i.src = src; });
+
+async function dibujarCertificado() {
+  try { await Promise.all([document.fonts.load('800 60px Poppins'), document.fonts.load('600 30px Poppins'), document.fonts.load('400 28px Poppins')]); } catch { /* sigue con la fuente del sistema */ }
+  const W = 1600, H = 1131, c = document.createElement('canvas'); c.width = W; c.height = H;
+  const x = c.getContext('2d');
+  const AZUL = '#002C71', DORADO = '#EAAA00', MAG = '#910048', GRIS = '#4a5461';
+  x.fillStyle = '#fff'; x.fillRect(0, 0, W, H);
+  x.fillStyle = '#fbf7ec'; x.fillRect(60, 60, W - 120, H - 120);
+  x.strokeStyle = DORADO; x.lineWidth = 16; x.strokeRect(28, 28, W - 56, H - 56);
+  x.strokeStyle = AZUL; x.lineWidth = 3; x.strokeRect(60, 60, W - 120, H - 120);
+  x.fillStyle = DORADO;
+  [[60, 60, 1, 1], [W - 60, 60, -1, 1], [60, H - 60, 1, -1], [W - 60, H - 60, -1, -1]].forEach(([a, b, sx, sy]) => {
+    x.beginPath(); x.moveTo(a, b); x.lineTo(a + 84 * sx, b); x.lineTo(a, b + 84 * sy); x.closePath(); x.fill();
+  });
+  x.textAlign = 'left'; x.font = '800 48px Poppins, sans-serif';
+  x.fillStyle = AZUL; x.fillText('Misión', 130, 150);
+  x.fillStyle = '#C88E00'; x.fillText('Agregación', 130, 202);
+  x.fillStyle = GRIS; x.font = '600 20px Poppins, sans-serif'; x.fillText('Simulación laboral de SQL', 132, 238);
+  try {
+    const svg = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="-4 0 128 142" width="256" height="284">${dato({ cara: 'festeja', brazos: 'arriba' })}</svg>`;
+    const im = await cargarImg('data:image/svg+xml;charset=utf-8,' + encodeURIComponent(svg));
+    x.drawImage(im, W - 300, 92, 180, 200);
+  } catch { /* sin mascota */ }
+  const centro = (txt, y, fuente, color) => {
+    x.font = fuente; x.fillStyle = color; x.textAlign = 'center';
+    let f = fuente;   // achica la letra si la línea no entra en el marco
+    while (x.measureText(txt).width > W - 260) { f = f.replace(/(\d+)px/, (_, t) => `${t - 1}px`); x.font = f; }
+    x.fillText(txt, W / 2, y);
+  };
+  centro('CERTIFICADO DE LOGRO', 330, '800 66px Poppins, sans-serif', AZUL);
+  x.fillStyle = DORADO; x.fillRect(W / 2 - 160, 352, 320, 6);
+  centro('Se otorga a', 425, '400 30px Poppins, sans-serif', GRIS);
+  const nombre = `${E.nombre} ${E.apellido}`;
+  let tam = 78; x.font = `800 ${tam}px Poppins, sans-serif`;
+  while (x.measureText(nombre).width > W - 360 && tam > 40) { tam -= 4; x.font = `800 ${tam}px Poppins, sans-serif`; }
+  centro(nombre, 515, `800 ${tam}px Poppins, sans-serif`, MAG);
+  x.strokeStyle = DORADO; x.lineWidth = 3; x.beginPath(); x.moveTo(W / 2 - 420, 545); x.lineTo(W / 2 + 420, 545); x.stroke();
+  centro(`por completar la simulación laboral «Una semana como analista de datos en ${M.banco}»`, 620, '600 30px Poppins, sans-serif', AZUL);
+  centro('COUNT · SUM · AVG · MIN · MAX · GROUP BY · HAVING', 670, '600 24px "JetBrains Mono", Consolas, monospace', GRIS);
+  centro(`Funciones de agregación y agrupación en SQL · ${M.banco} es un banco ficticio con fines educativos`, 720, '400 22px Poppins, sans-serif', GRIS);
+  const a = aciertos(), p = Math.round(a / TOTAL * 100);
+  const datos = [[`${a} de ${TOTAL}`, 'bien resueltas al primer intento'], [`${p} %`, 'de precisión'], [rango(p), 'cargo alcanzado']];
+  datos.forEach(([v, et], i) => {
+    const cx = W / 2 + (i - 1) * 420, y = 790;
+    x.fillStyle = i === 2 ? '#fdf2f7' : '#eef3fb'; x.strokeStyle = i === 2 ? MAG : AZUL; x.lineWidth = 2;
+    x.beginPath();
+    if (x.roundRect) x.roundRect(cx - 190, y, 380, 110, 18); else x.rect(cx - 190, y, 380, 110);
+    x.fill(); x.stroke();
+    x.textAlign = 'center'; x.fillStyle = i === 2 ? MAG : AZUL;
+    let t = 40; x.font = `800 ${t}px Poppins, sans-serif`;
+    while (x.measureText(v).width > 350 && t > 22) { t -= 2; x.font = `800 ${t}px Poppins, sans-serif`; }
+    x.fillText(v, cx, y + 58);
+    x.font = '400 20px Poppins, sans-serif'; x.fillStyle = GRIS; x.fillText(et, cx, y + 92);
+  });
+  const fecha = new Date().toLocaleDateString('es-EC', { day: 'numeric', month: 'long', year: 'numeric' });
+  x.textAlign = 'left'; x.fillStyle = GRIS; x.font = '400 24px Poppins, sans-serif';
+  x.fillText(fecha.charAt(0).toUpperCase() + fecha.slice(1), 130, 985);
+  x.font = '400 18px Poppins, sans-serif'; x.fillText('Fecha', 130, 1012);
+  x.textAlign = 'right'; x.font = '400 24px "JetBrains Mono", Consolas, monospace';
+  x.fillText(codigo(`${nombre}|${a}|${fecha}`), W - 130, 985);
+  x.font = '400 18px Poppins, sans-serif'; x.fillText('Código de verificación', W - 130, 1012);
+  return c;
+}
+
+async function certificado() {
+  if (!todoHecho()) { mapa(); return; }
+  pintar(`<div class="card centro"><h2 style="justify-content:center">${ICONO.trofeo} Tu certificado</h2>
+      <p class="suave" id="gen">Generando…</p><div id="certzona"></div></div>`);
+  const c = await dibujarCertificado();
+  const url = c.toDataURL('image/png');
+  const archivo = `Certificado-${E.nombre}-${E.apellido}.png`.replace(/\s+/g, '-');
+  $('#certzona').innerHTML = `<img class="cert" src="${url}" alt="Certificado de ${esc(E.nombre)} ${esc(E.apellido)}">
+    <div class="fila-btn"><a class="btn grande" id="descargar" href="${url}" download="${esc(archivo)}">${ICONO.descargar} Descargar certificado</a></div>
+    <p class="suave">En el celular también puedes mantener presionada la imagen para guardarla.</p>
+    <div class="fila-btn"><button class="btn sec" id="mapa">${ICONO.agenda} Volver a la agenda</button></div>`;
+  $('#gen').remove();
+  $('#mapa').onclick = mapa;
+  confeti();
+}
+
+/* ---------------- arranque: la agenda se abre con la sal; cada pedido, con su llave ---------------- */
+async function arrancar() {
+  M = await abrirCon(J.mapa, J.sal, 'mapa');
+  K0 = await Cifra.huella(J.sal, 'inicio');
+  E = cargar();
+  inicio();
+}
+arrancar();
